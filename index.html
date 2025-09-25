@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MMORPG Client - World Map</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+
+    <script>
+      (function initializeClient() {
+        const canvas = document.getElementById('game');
+        /** @type {CanvasRenderingContext2D | null} */
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+
+        // ----- Images -----
+        const worldImage = new Image();
+        worldImage.src = 'world.jpg';
+
+        // Avatar image cache: key -> HTMLImageElement
+        const imageCache = new Map();
+
+        // ----- World/Viewport State -----
+        const state = {
+          dpr: Math.max(1, Math.floor(window.devicePixelRatio || 1)),
+          viewportWidthCss: window.innerWidth,
+          viewportHeightCss: window.innerHeight,
+          cameraX: 0,
+          cameraY: 0,
+          cameraTargetX: 0,
+          cameraTargetY: 0,
+          worldWidth: 0,
+          worldHeight: 0,
+          playerId: null,
+          players: {},
+          avatars: {},
+          renderPlayers: {},
+          dirty: true,
+          lastTs: 0
+        };
+
+        function setCanvasSize() {
+          state.viewportWidthCss = window.innerWidth;
+          state.viewportHeightCss = window.innerHeight;
+          const width = state.viewportWidthCss;
+          const height = state.viewportHeightCss;
+          const dpr = state.dpr;
+          // Set backing store size for crisp rendering on HiDPI
+          canvas.width = Math.floor(width * dpr);
+          canvas.height = Math.floor(height * dpr);
+          // CSS size in CSS pixels
+          canvas.style.width = width + 'px';
+          canvas.style.height = height + 'px';
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          state.dirty = true;
+        }
+
+        function clamp(value, min, max) {
+          if (max < min) return min;
+          return Math.max(min, Math.min(max, value));
+        }
+
+        function centerCameraOn(x, y) {
+          const vw = state.viewportWidthCss;
+          const vh = state.viewportHeightCss;
+          const ww = state.worldWidth;
+          const wh = state.worldHeight;
+
+          let camX = x - vw / 2;
+          let camY = y - vh / 2;
+
+          camX = clamp(camX, 0, Math.max(0, ww - vw));
+          camY = clamp(camY, 0, Math.max(0, wh - vh));
+
+          state.cameraTargetX = camX;
+          state.cameraTargetY = camY;
+          state.dirty = true;
+        }
+
+        function snapCameraToTarget() {
+          state.cameraX = state.cameraTargetX;
+          state.cameraY = state.cameraTargetY;
+        }
+
+        function ensureImageCached(src) {
+          if (!src) return null;
+          let img = imageCache.get(src);
+          if (!img) {
+            img = new Image();
+            img.src = src;
+            img.addEventListener('load', () => {
+              state.dirty = true;
+            });
+            imageCache.set(src, img);
+          }
+          return img;
+        }
+
+        function frameForPlayer(player) {
+          if (!player) return null;
+          const avatarName = player.avatar;
+          const avatarDef = state.avatars[avatarName];
+          if (!avatarDef) return null;
+          const facing = player.facing || 'south';
+          const frameIndex = player.animationFrame || 0;
+          const useFacing = facing === 'west' ? 'east' : facing;
+          const flipHorizontal = facing === 'west';
+          const framesForFacing = (avatarDef.frames && avatarDef.frames[useFacing]) || [];
+          const src = framesForFacing[frameIndex] || framesForFacing[0];
+          const img = ensureImageCached(src);
+          if (!img) return null;
+          return { img, flipHorizontal };
+        }
+
+        function interpolatePositions(dtSec) {
+          // Exponential smoothing factor per second
+          const smoothingPerSecond = 12; // higher -> snappier
+          const t = 1 - Math.exp(-smoothingPerSecond * dtSec);
+
+          // Camera smoothing towards target
+          state.cameraX += (state.cameraTargetX - state.cameraX) * t;
+          state.cameraY += (state.cameraTargetY - state.cameraY) * t;
+
+          for (const id in state.players) {
+            const target = state.players[id];
+            if (!target) continue;
+            // Clamp target to map bounds using avatar size if available
+            const info = frameForPlayer(target);
+            const imgW = info && info.img && info.img.complete ? (info.img.naturalWidth || info.img.width) : 0;
+            const imgH = info && info.img && info.img.complete ? (info.img.naturalHeight || info.img.height) : 0;
+            const halfW = imgW / 2;
+            const halfH = imgH / 2;
+            const clampedX = clamp(target.x, halfW, Math.max(halfW, state.worldWidth - halfW));
+            const clampedY = clamp(target.y, halfH, Math.max(halfH, state.worldHeight - halfH));
+
+            let renderP = state.renderPlayers[id];
+            if (!renderP) {
+              renderP = { x: clampedX, y: clampedY };
+              state.renderPlayers[id] = renderP;
+            }
+            renderP.x += (clampedX - renderP.x) * t;
+            renderP.y += (clampedY - renderP.y) * t;
+          }
+        }
+
+        function render() {
+          state.dirty = false;
+
+          const vw = state.viewportWidthCss;
+          const vh = state.viewportHeightCss;
+          ctx.clearRect(0, 0, vw, vh);
+
+          // Draw the world slice corresponding to the camera
+          if (worldImage.complete && state.worldWidth && state.worldHeight) {
+            ctx.imageSmoothingEnabled = false;
+            ctx.drawImage(
+              worldImage,
+              state.cameraX,
+              state.cameraY,
+              vw,
+              vh,
+              0,
+              0,
+              vw,
+              vh
+            );
+          }
+
+          // Draw all players (others first), then Tim on top
+          const me = state.playerId && state.players[state.playerId];
+          for (const id in state.players) {
+            if (id === state.playerId) continue;
+            const p = state.players[id];
+            const info = frameForPlayer(p);
+            if (!info || !info.img.complete) continue;
+            const rp = state.renderPlayers[id] || p;
+            const screenX = rp.x - state.cameraX;
+            const screenY = rp.y - state.cameraY;
+            const imgW = info.img.naturalWidth || info.img.width;
+            const imgH = info.img.naturalHeight || info.img.height;
+            const left = Math.round(screenX - imgW / 2);
+            const top = Math.round(screenY - imgH / 2);
+            // Viewport culling
+            if (left > vw || top > vh || left + imgW < 0 || top + imgH < 0) {
+              continue;
+            }
+            if (info.flipHorizontal) {
+              ctx.save();
+              ctx.translate(Math.round(screenX), 0);
+              ctx.scale(-1, 1);
+              ctx.drawImage(info.img, -Math.round(imgW / 2), top);
+              ctx.restore();
+            } else {
+              ctx.drawImage(info.img, left, top);
+            }
+            // Label
+            const label = p.username || '';
+            if (label) {
+              ctx.font = '14px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+              ctx.textBaseline = 'bottom';
+              ctx.textAlign = 'center';
+              const textX = Math.round(screenX);
+              const textY = top - 6;
+              const paddingX = 6;
+              const paddingY = 3;
+              const metrics = ctx.measureText(label);
+              const textW = Math.ceil(metrics.width);
+              const rectW = textW + paddingX * 2;
+              const rectH = 18 + paddingY * 2;
+              ctx.fillStyle = 'rgba(0,0,0,0.6)';
+              ctx.fillRect(textX - rectW / 2, textY - rectH, rectW, rectH);
+              ctx.fillStyle = '#ffffff';
+              ctx.fillText(label, textX, textY - paddingY);
+            }
+          }
+
+          // Draw Tim (our player) centered when possible, last
+          const frameInfo = frameForPlayer(me);
+          if (me && frameInfo && frameInfo.img && frameInfo.img.complete) {
+            const frameImg = frameInfo.img;
+            const rpMe = state.renderPlayers[state.playerId] || me;
+            const screenX = rpMe.x - state.cameraX;
+            const screenY = rpMe.y - state.cameraY;
+            const imgW = frameImg.naturalWidth || frameImg.width;
+            const imgH = frameImg.naturalHeight || frameImg.height;
+            const drawY = Math.round(screenY - imgH / 2);
+
+            if (frameInfo.flipHorizontal) {
+              ctx.save();
+              ctx.translate(Math.round(screenX), 0);
+              ctx.scale(-1, 1);
+              ctx.drawImage(frameImg, -Math.round(imgW / 2), drawY);
+              ctx.restore();
+            } else {
+              const drawX = Math.round(screenX - imgW / 2);
+              ctx.drawImage(frameImg, drawX, drawY);
+            }
+
+            // Username label background
+            const label = me.username || 'Tim';
+            ctx.font = '14px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+            ctx.textBaseline = 'bottom';
+            ctx.textAlign = 'center';
+            const textX = Math.round(screenX);
+            const textY = drawY - 6;
+            const paddingX = 6;
+            const paddingY = 3;
+            const metrics = ctx.measureText(label);
+            const textW = Math.ceil(metrics.width);
+            const rectW = textW + paddingX * 2;
+            const rectH = 18 + paddingY * 2;
+
+            ctx.fillStyle = 'rgba(0,0,0,0.6)';
+            ctx.fillRect(textX - rectW / 2, textY - rectH, rectW, rectH);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText(label, textX, textY - paddingY);
+          }
+        }
+
+        function requestRender() {
+          state.dirty = true;
+          // Schedule on next animation frame
+          // Handled by the continuous loop now
+        }
+
+        function handleResize() {
+          setCanvasSize();
+          // Re-center camera on Tim if present
+          const me = state.playerId && state.players[state.playerId];
+          if (me) centerCameraOn(me.x, me.y);
+          requestRender();
+        }
+
+        window.addEventListener('resize', handleResize);
+
+        // ----- WebSocket -----
+        let socket = null;
+        function connect() {
+          try {
+            socket = new WebSocket('wss://codepath-mmorg.onrender.com');
+          } catch (e) {
+            // If creation fails, mark dirty so at least world renders
+            requestRender();
+            return;
+          }
+
+          socket.addEventListener('open', () => {
+            socket?.send(
+              JSON.stringify({ action: 'join_game', username: 'Tim' })
+            );
+          });
+
+          socket.addEventListener('message', (event) => {
+            try {
+              const msg = JSON.parse(event.data);
+              if (msg.action === 'join_game' && msg.success) {
+                state.playerId = msg.playerId;
+                state.players = msg.players || {};
+                state.avatars = msg.avatars || {};
+                // Precache one frame per facing for all known avatars
+                for (const name in state.avatars) {
+                  const av = state.avatars[name];
+                  if (av && av.frames) {
+                    ensureImageCached(av.frames.south && av.frames.south[0]);
+                    ensureImageCached(av.frames.north && av.frames.north[0]);
+                    ensureImageCached(av.frames.east && av.frames.east[0]);
+                  }
+                }
+                // Precache Tim's current frame
+                const me = state.players[state.playerId];
+                if (me) {
+                  const avatar = state.avatars[me.avatar];
+                  if (avatar && avatar.frames) {
+                    const south0 = (avatar.frames.south && avatar.frames.south[0]) || null;
+                    ensureImageCached(south0);
+                  }
+                  // Center camera on Tim
+                  centerCameraOn(me.x, me.y);
+                }
+                requestRender();
+                return;
+              }
+              if (msg.action === 'players_moved' && msg.players) {
+                for (const id in msg.players) {
+                  state.players[id] = {
+                    ...(state.players[id] || {}),
+                    ...msg.players[id]
+                  };
+                }
+                const me = state.playerId && state.players[state.playerId];
+                if (me) centerCameraOn(me.x, me.y);
+                // mark dirty to reflect new targets; loop will render
+                state.dirty = true;
+                return;
+              }
+              if (msg.action === 'player_joined' && msg.player) {
+                state.players[msg.player.id] = msg.player;
+                if (msg.avatar) {
+                  state.avatars[msg.avatar.name] = msg.avatar;
+                  // precache one frame per facing
+                  ensureImageCached(msg.avatar.frames && msg.avatar.frames.south && msg.avatar.frames.south[0]);
+                  ensureImageCached(msg.avatar.frames && msg.avatar.frames.north && msg.avatar.frames.north[0]);
+                  ensureImageCached(msg.avatar.frames && msg.avatar.frames.east && msg.avatar.frames.east[0]);
+                }
+                state.dirty = true;
+                return;
+              }
+              if (msg.success === false) {
+                // Error message; ignore for now but trigger a render
+                requestRender();
+              }
+            } catch (_e) {
+              // ignore malformed messages
+            }
+          });
+
+          socket.addEventListener('close', () => {
+            // No reconnect for this milestone
+          });
+        }
+
+        // ----- Keyboard movement -----
+        const pressed = [];
+        const dirForKey = (code) => {
+          switch (code) {
+            case 'ArrowUp': return 'up';
+            case 'ArrowDown': return 'down';
+            case 'ArrowLeft': return 'left';
+            case 'ArrowRight': return 'right';
+            default: return null;
+          }
+        };
+
+        function sendMove(direction) {
+          if (!socket || socket.readyState !== WebSocket.OPEN) return;
+          socket.send(JSON.stringify({ action: 'move', direction }));
+        }
+
+        function sendStop() {
+          if (!socket || socket.readyState !== WebSocket.OPEN) return;
+          socket.send(JSON.stringify({ action: 'stop' }));
+        }
+
+        function handleKeyDown(e) {
+          const dir = dirForKey(e.code);
+          if (!dir) return;
+          e.preventDefault();
+          // maintain most-recent ordering
+          const existingIdx = pressed.indexOf(dir);
+          if (existingIdx !== -1) pressed.splice(existingIdx, 1);
+          pressed.push(dir);
+          // send a move every keydown (including repeats)
+          sendMove(dir);
+        }
+
+        function handleKeyUp(e) {
+          const dir = dirForKey(e.code);
+          if (!dir) return;
+          e.preventDefault();
+          const idx = pressed.indexOf(dir);
+          if (idx !== -1) pressed.splice(idx, 1);
+          const fallback = pressed[pressed.length - 1];
+          if (fallback) {
+            sendMove(fallback);
+          } else {
+            sendStop();
+          }
+        }
+
+        function handleBlur() {
+          if (pressed.length) {
+            pressed.length = 0;
+            sendStop();
+          }
+        }
+
+        // ----- Loop -----
+        function loop(tsMs) {
+          if (!state.lastTs) state.lastTs = tsMs;
+          const dtSec = Math.max(0, (tsMs - state.lastTs) / 1000);
+          state.lastTs = tsMs;
+
+          interpolatePositions(dtSec);
+          render();
+          window.requestAnimationFrame(loop);
+        }
+
+        // ----- Boot -----
+        function bootWhenReady() {
+          if (!worldImage.complete) {
+            worldImage.addEventListener('load', () => {
+              state.worldWidth = worldImage.naturalWidth || worldImage.width;
+              state.worldHeight = worldImage.naturalHeight || worldImage.height;
+              // Re-center camera now that we know world dimensions
+              const me = state.playerId && state.players[state.playerId];
+              if (me) centerCameraOn(me.x, me.y);
+              requestRender();
+            }, { once: true });
+          } else {
+            state.worldWidth = worldImage.naturalWidth || worldImage.width;
+            state.worldHeight = worldImage.naturalHeight || worldImage.height;
+            const me = state.playerId && state.players[state.playerId];
+            if (me) centerCameraOn(me.x, me.y);
+          }
+
+          setCanvasSize();
+          connect();
+          window.addEventListener('keydown', handleKeyDown);
+          window.addEventListener('keyup', handleKeyUp);
+          window.addEventListener('blur', handleBlur);
+          window.requestAnimationFrame(loop);
+        }
+
+        bootWhenReady();
+      })();
+    </script>
+  </body>
+  </html>
+
+
